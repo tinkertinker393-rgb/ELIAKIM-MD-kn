@@ -4,7 +4,8 @@ const {
     DisconnectReason,
     getContentType,
     makeCacheableSignalKeyStore,
-    jidNormalizedUser
+    jidNormalizedUser,
+    downloadMediaMessage
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const { Boom } = require("@hapi/boom");
@@ -15,9 +16,7 @@ const zlib = require("zlib");
 const SESSION_FOLDER = 'session';
 const PREFIX = "!"; 
 const SESSION_ID = process.env.SESSION_ID; 
-
-// This map stores every message the bot sees.
-// If a message is deleted later, we grab it from here.
+const logger = pino({ level: 'silent' });
 const msgCache = new Map();
 
 async function restoreSession() {
@@ -27,10 +26,11 @@ async function restoreSession() {
         try {
             const base64Data = SESSION_ID.includes(';;;') ? SESSION_ID.split(';;;')[1] : SESSION_ID;
             const buffer = Buffer.from(base64Data, 'base64');
-            const decompressed = zlib.gunzipSync(buffer);
-            await fs.writeFile(credsPath, decompressed);
+            let decoded;
+            try { decoded = zlib.gunzipSync(buffer); } catch { decoded = buffer; }
+            await fs.writeFile(credsPath, decoded);
             console.log("✅ Session Restored.");
-        } catch (e) { console.log("❌ SESSION_ID error."); }
+        } catch (e) { console.log("❌ Session ID error."); }
     }
 }
 
@@ -39,114 +39,130 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_FOLDER);
 
     const conn = makeWASocket({
-        logger: pino({ level: 'silent' }),
+        logger: logger,
         auth: {
             creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+            keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
         browser: ["Knight-Lite", "Chrome", "121.0.0"],
-        markOnlineOnConnect: true,
+        markOnlineOnConnect: true
     });
 
     conn.ev.on('creds.update', saveCreds);
 
-    // --- 1. HANDLING NEW MESSAGES ---
-    conn.ev.on('messages.upsert', async (chatUpdate) => {
+    conn.ev.on('messages.upsert', async ({ messages }) => {
         try {
-            const m = chatUpdate.messages[0];
+            const m = messages[0];
             if (!m.message) return;
 
             const from = m.key.remoteJid;
+            const isGroup = from.endsWith('@g.us');
+            const sender = isGroup ? m.key.participant : from;
             const ownerJid = jidNormalizedUser(conn.user.id);
-            const sender = m.key.participant || m.key.remoteJid;
 
-            // AUTO-VIEW STATUS
+            // 1. AUTO VIEW STATUS
             if (from === 'status@broadcast') {
                 await conn.readMessages([m.key]);
                 return;
             }
 
-            // --- DEEP MESSAGE PARSING ---
-            // We dig through layers: Ephemeral -> ViewOnce -> Content
-            let messageType = getContentType(m.message);
-            let msgContent = m.message;
-
-            if (messageType === 'ephemeralMessage') {
-                msgContent = msgContent.ephemeralMessage.message;
-                messageType = getContentType(msgContent);
-            }
-
-            let isViewOnce = false;
-            if (messageType === 'viewOnceMessageV2' || messageType === 'viewOnceMessage') {
-                isViewOnce = true;
-                msgContent = msgContent[messageType].message;
-                messageType = getContentType(msgContent);
-            }
-
-            // CACHE FOR ANTI-DELETE: Store message so we can recover it later
+            // 2. CACHE FOR ANTIDELETE
             msgCache.set(m.key.id, m);
             if (msgCache.size > 1000) msgCache.delete(msgCache.keys().next().value);
 
-            // ALWAYS TYPING
+            // 3. ALWAYS TYPING
             if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
 
-            // AUTO-VIEWONCE FORWARDING
-            if (isViewOnce && !m.key.fromMe) {
-                await conn.sendMessage(ownerJid, { 
-                    text: `📸 *VIEW-ONCE DETECTED*\n*From:* @${sender.split('@')[0]}`, 
-                    mentions: [sender] 
-                });
-                await conn.sendMessage(ownerJid, { forward: { message: msgContent, key: m.key } });
+            // 4. CONTENT PARSING
+            const type = getContentType(m.message);
+            const content = type === 'ephemeralMessage' ? m.message.ephemeralMessage.message : m.message;
+            const msgType = getContentType(content);
+            const body = (msgType === 'conversation') ? content.conversation : 
+                         (msgType === 'extendedTextMessage') ? content.extendedTextMessage.text : 
+                         (content[msgType]?.caption) ? content[msgType].caption : '';
+
+            // 5. ANTILINK LOGIC
+            const containsLink = /(https?:\/\/[^\s]+)/g.test(body);
+            if (isGroup && containsLink && !m.key.fromMe) {
+                const groupMetadata = await conn.groupMetadata(from);
+                const admins = groupMetadata.participants.filter(p => p.admin).map(p => p.id);
+                if (!admins.includes(sender)) {
+                    if (admins.includes(ownerJid)) {
+                        await conn.sendMessage(from, { delete: m.key });
+                        await conn.sendMessage(from, { text: `🚫 *ANTILINK:* @${sender.split('@')[0]}, links are forbidden.`, mentions: [sender] });
+                    }
+                }
             }
 
-            // COMMANDS (Ping)
-            const body = (messageType === 'conversation') ? msgContent.conversation : 
-                         (messageType === 'extendedTextMessage') ? msgContent.extendedTextMessage.text : 
-                         (msgContent[messageType]?.caption) ? msgContent[messageType].caption : '';
+            // 6. VIEW-ONCE RETRIEVAL (BUFFER METHOD)
+            const isViewOnce = msgType === 'viewOnceMessageV2' || msgType === 'viewOnceMessage';
+            if (isViewOnce && !m.key.fromMe) {
+                const viewOnceContent = content[msgType].message;
+                const mediaType = getContentType(viewOnceContent);
+                const buffer = await downloadMediaMessage(m, 'buffer', {}, { logger, reuploadRequest: conn.updateMediaMessage });
 
+                const caption = `📸 *VIEW-ONCE BYPASS*\n\n*From:* @${sender.split('@')[0]}\n*Type:* ${mediaType}`;
+                if (mediaType === 'imageMessage') {
+                    await conn.sendMessage(ownerJid, { image: buffer, caption, mentions: [sender] });
+                } else if (mediaType === 'videoMessage') {
+                    await conn.sendMessage(ownerJid, { video: buffer, caption, mentions: [sender] });
+                }
+            }
+
+            // 7. COMMANDS
             if (body.startsWith(PREFIX)) {
-                const args = body.slice(PREFIX.length).trim().split(/\s+/);
-                const command = args.shift().toLowerCase();
+                const command = body.slice(PREFIX.length).trim().split(/\s+/)[0].toLowerCase();
                 if (command === "ping") {
                     await conn.sendMessage(from, { text: "☠️ *Knight-Lite Ultra is online*" }, { quoted: m });
                 }
             }
-        } catch (err) { console.error("Upsert Error:", err); }
+        } catch (err) { console.error(err); }
     });
 
-    // --- 2. THE ANTI-DELETE LISTENER (Delete for Everyone) ---
+    // 8. ANTIDELETE LISTENER
     conn.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
-            // protocolMessage type 0 = "Delete for Everyone" (Revoke)
             if (update.update.protocolMessage?.type === 0) {
-                const deletedMsgId = update.update.protocolMessage.key.id;
-                const originalMsg = msgCache.get(deletedMsgId);
-
-                if (originalMsg) {
+                const deletedId = update.update.protocolMessage.key.id;
+                const cachedMsg = msgCache.get(deletedId);
+                if (cachedMsg) {
                     const ownerJid = jidNormalizedUser(conn.user.id);
-                    const sender = originalMsg.key.participant || originalMsg.key.remoteJid;
-
-                    await conn.sendMessage(ownerJid, { 
-                        text: `🛡️ *DELETED FOR EVERYONE*\n\n*From:* @${sender.split('@')[0]}\n*Chat:* ${originalMsg.key.remoteJid}`, 
-                        mentions: [sender] 
-                    });
-
-                    // Send the deleted message back to you
-                    await conn.sendMessage(ownerJid, { forward: originalMsg });
-                    msgCache.delete(deletedMsgId); // Clear it from memory
+                    const sender = cachedMsg.key.participant || cachedMsg.key.remoteJid;
+                    await conn.sendMessage(ownerJid, { text: `🛡️ *DELETED MESSAGE DETECTED*\n*From:* @${sender.split('@')[0]}`, mentions: [sender] });
+                    await conn.sendMessage(ownerJid, { forward: cachedMsg }, { quoted: cachedMsg });
                 }
             }
         }
     });
 
-    conn.ev.on('connection.update', (u) => {
-        if (u.connection === 'open') {
+    // 9. COOL CONNECTION DASHBOARD
+    conn.ev.on('connection.update', async (u) => {
+        const { connection, lastDisconnect } = u;
+        if (connection === 'open') {
             const ownerJid = jidNormalizedUser(conn.user.id);
-            conn.sendMessage(ownerJid, { text: "✅ *KNIGHT-LITE ULTRA CONNECTED*\n\nAntidelete: Active\nView-Once: Active\nStatus-View: Active" });
-            console.log('✅ BOT READY');
+            const time = new Date().toLocaleTimeString();
+            
+            const dashboard = "```" + 
+                "  ⚔️ KNIGHT-LITE ULTRA ⚔️\n" +
+                "  ───────────────────────\n" +
+                "  [ SYSTEM STATUS: ONLINE ]\n\n" +
+                "  👤 USER: " + conn.user.name + "\n" +
+                "  ⏰ TIME: " + time + "\n" +
+                "  🛡️ ANTIDELETE: ACTIVE\n" +
+                "  📸 VIEWONCE:   BYPASS\n" +
+                "  🚫 ANTILINK:   SHIELD ON\n" +
+                "  👀 AUTO-VIEW:  ENABLED\n\n" +
+                "  ───────────────────────\n" +
+                "   K N I G H T - L I T E\n" +
+                "  ───────────────────────\n" +
+                "  TEST: Type !ping```";
+            
+            await conn.sendMessage(ownerJid, { text: dashboard });
+            console.log('✅ KNIGHT-LITE ULTRA CONNECTED');
         }
-        if (u.connection === 'close') {
-            if (new Boom(u.lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut) startBot();
+        if (connection === 'close') {
+            const shouldReconnect = (new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut);
+            if (shouldReconnect) startBot();
         }
     });
 }
