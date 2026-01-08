@@ -26,7 +26,7 @@ jobs:
 
       - name: Run Bot Loop
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WAZIMU }}
         run: |
           # 1. Trigger the next session after 5 hours 30 mins
           (
