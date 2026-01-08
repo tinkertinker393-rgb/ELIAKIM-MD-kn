@@ -1,0 +1,45 @@
+name: ☠️ Knight-Lite Nonstop
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: bot-runtime
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Bot Loop
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          # 1. Trigger the next session after 5 hours 30 mins
+          (
+            sleep 19800
+            curl -X POST -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/nonstop.yml/dispatches" \
+            -d '{"ref":"main"}'
+          ) &
+
+          # 2. Start Bot and Auto-Restart on crash
+          while true; do
+            node --max-old-space-size=2560 index.js
+            echo "Bot crashed. Restarting in 5 seconds..."
+            sleep 5
+          done
