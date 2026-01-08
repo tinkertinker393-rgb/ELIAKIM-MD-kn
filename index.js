@@ -19,6 +19,25 @@ const SESSION_ID = process.env.SESSION_ID;
 const logger = pino({ level: 'silent' });
 const msgCache = new Map();
 
+// Feature toggles
+const features = {
+    antilink: true,
+    antidelete: true,
+    autoview: true
+};
+
+// Pretty logger
+function logEvent(type, details) {
+    const time = new Date().toLocaleTimeString();
+    console.log(
+        `\n──────────────────────────────\n` +
+        `⏰ ${time}\n` +
+        `📌 EVENT: ${type}\n` +
+        `🔎 DETAILS: ${details}\n` +
+        `──────────────────────────────\n`
+    );
+}
+
 async function restoreSession() {
     await fs.ensureDir(SESSION_FOLDER);
     const credsPath = path.join(SESSION_FOLDER, 'creds.json');
@@ -60,9 +79,20 @@ async function startBot() {
             const sender = jidNormalizedUser(isGroup ? m.key.participant : from);
             const ownerJid = jidNormalizedUser(conn.user.id);
 
+            // Log incoming message
+            const type = getContentType(m.message);
+            const content = type === 'ephemeralMessage' ? m.message.ephemeralMessage.message : m.message;
+            const msgType = getContentType(content);
+            const body = (msgType === 'conversation') ? content.conversation :
+                         (msgType === 'extendedTextMessage') ? content.extendedTextMessage.text :
+                         (content[msgType]?.caption) ? content[msgType].caption : '';
+
+            console.log(`💬 Message from ${sender} (${isGroup ? "Group" : "Private"}): ${body}`);
+
             // 1. AUTO VIEW STATUS
-            if (from === 'status@broadcast') {
+            if (features.autoview && from === 'status@broadcast') {
                 await conn.readMessages([m.key]);
+                logEvent("AUTOVIEW", `Viewed status from ${sender}`);
                 return;
             }
 
@@ -73,17 +103,9 @@ async function startBot() {
             // 3. ALWAYS TYPING
             if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
 
-            // 4. CONTENT PARSING
-            const type = getContentType(m.message);
-            const content = type === 'ephemeralMessage' ? m.message.ephemeralMessage.message : m.message;
-            const msgType = getContentType(content);
-            const body = (msgType === 'conversation') ? content.conversation :
-                         (msgType === 'extendedTextMessage') ? content.extendedTextMessage.text :
-                         (content[msgType]?.caption) ? content[msgType].caption : '';
-
-            // 5. ANTILINK LOGIC
+            // 4. ANTILINK LOGIC
             const containsLink = /(https?:\/\/[^\s]+)/g.test(body);
-            if (isGroup && containsLink && !m.key.fromMe) {
+            if (features.antilink && isGroup && containsLink && !m.key.fromMe) {
                 try {
                     const groupMetadata = await conn.groupMetadata(from);
                     const admins = groupMetadata.participants
@@ -97,6 +119,7 @@ async function startBot() {
                                 text: `🚫 *ANTILINK:* @${sender.split('@')[0]}, links are forbidden.`,
                                 mentions: [sender]
                             });
+                            logEvent("ANTILINK", `Blocked link from ${sender} in ${from}`);
                         }
                     }
                 } catch (err) {
@@ -104,44 +127,78 @@ async function startBot() {
                 }
             }
 
-            // 6. VIEW-ONCE RETRIEVAL
-            const isViewOnce = msgType === 'viewOnceMessageV2' || msgType === 'viewOnceMessage';
-            if (isViewOnce && !m.key.fromMe) {
-                const viewOnceContent = content[msgType].message;
-                const mediaType = getContentType(viewOnceContent);
-                try {
-                    const buffer = await downloadMediaMessage(
-                        { message: viewOnceContent },
-                        'buffer',
-                        {},
-                        { logger, reuploadRequest: conn.updateMediaMessage }
-                    );
-
-                    const caption = `📸 *VIEW-ONCE BYPASS*\n\n*From:* @${sender.split('@')[0]}\n*Type:* ${mediaType}`;
-                    if (mediaType === 'imageMessage') {
-                        await conn.sendMessage(ownerJid, { image: buffer, caption, mentions: [sender] });
-                    } else if (mediaType === 'videoMessage') {
-                        await conn.sendMessage(ownerJid, { video: buffer, caption, mentions: [sender] });
-                    }
-                } catch (err) {
-                    console.error("ViewOnce error:", err);
-                }
-            }
-
-            // 7. COMMANDS
+            // 5. COMMANDS
             if (body.startsWith(PREFIX)) {
-                const command = body.slice(PREFIX.length).trim().split(/\s+/)[0].toLowerCase();
-                if (command === "ping") {
-                    await conn.sendMessage(from, { text: "☠️ *Knight-Lite Ultra is online*" }, { quoted: m });
+                const args = body.slice(PREFIX.length).trim().split(/\s+/);
+                const command = args[0].toLowerCase();
+                console.log(`⚔️ Command: ${command} from ${sender}`);
+
+                switch (command) {
+                    case "ping":
+                        await conn.sendMessage(from, { text: "☠️ *Knight-Lite Ultra is online*" }, { quoted: m });
+                        break;
+
+                    case "antilink":
+                        if (args[1] === "on") features.antilink = true;
+                        if (args[1] === "off") features.antilink = false;
+                        await conn.sendMessage(from, { text: `🚫 Antilink is now *${features.antilink ? "ON" : "OFF"}*` }, { quoted: m });
+                        break;
+
+                    case "antidelete":
+                        if (args[1] === "on") features.antidelete = true;
+                        if (args[1] === "off") features.antidelete = false;
+                        await conn.sendMessage(from, { text: `🛡️ Antidelete is now *${features.antidelete ? "ON" : "OFF"}*` }, { quoted: m });
+                        break;
+
+                    case "autoview":
+                        if (args[1] === "on") features.autoview = true;
+                        if (args[1] === "off") features.autoview = false;
+                        await conn.sendMessage(from, { text: `👀 Auto-view status is now *${features.autoview ? "ON" : "OFF"}*` }, { quoted: m });
+                        break;
+
+                    case "vv":
+                        const quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+                        const quotedSender = m.message?.extendedTextMessage?.contextInfo?.participant;
+
+                        if (!quoted) break;
+
+                        const qType = getContentType(quoted);
+                        if (qType === 'viewOnceMessageV2' || qType === 'viewOnceMessage') {
+                            const viewOnceContent = quoted[qType].message;
+                            const mediaType = getContentType(viewOnceContent);
+
+                            try {
+                                const buffer = await downloadMediaMessage(
+                                    { message: viewOnceContent },
+                                    'buffer',
+                                    {},
+                                    { logger, reuploadRequest: conn.updateMediaMessage }
+                                );
+
+                                const caption = `📸 *VIEW-ONCE SAVED*\n\n*From:* @${quotedSender.split('@')[0]}\n*Type:* ${mediaType}`;
+                                if (mediaType === 'imageMessage') {
+                                    await conn.sendMessage(ownerJid, { image: buffer, caption, mentions: [quotedSender] });
+                                } else if (mediaType === 'videoMessage') {
+                                    await conn.sendMessage(ownerJid, { video: buffer, caption, mentions: [quotedSender] });
+                                }
+                                logEvent("VIEW-ONCE", `Saved view-once from ${quotedSender} → sent to owner DM`);
+                            } catch (err) {
+                                console.error("VV command error:", err);
+                            }
+                        }
+                        break;
+
+                    default:
+                        await conn.sendMessage(from, { text: "❓ Unknown command. Type !help for options." }, { quoted: m });
                 }
             }
         } catch (err) { console.error(err); }
     });
 
-    // 8. ANTIDELETE LISTENER
+    // ANTIDELETE LISTENER
     conn.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
-            if (update.update.protocolMessage?.type === 0) {
+            if (features.antidelete && update.update.protocolMessage?.type === 0) {
                 const deletedId = update.update.protocolMessage.key.id;
                 const cachedMsg = msgCache.get(deletedId);
                 if (cachedMsg) {
@@ -152,12 +209,13 @@ async function startBot() {
                         mentions: [sender]
                     });
                     await conn.sendMessage(ownerJid, { forward: cachedMsg }, { quoted: cachedMsg });
+                    logEvent("ANTIDELETE", `Recovered deleted message from ${sender} → sent to owner DM`);
                 }
             }
         }
     });
 
-    // 9. COOL CONNECTION DASHBOARD
+    // CONNECTION DASHBOARD
     conn.ev.on('connection.update', async (u) => {
         const { connection, lastDisconnect } = u;
         if (connection === 'open') {
@@ -170,10 +228,10 @@ async function startBot() {
                 "  [ SYSTEM STATUS: ONLINE ]\n\n" +
                 "  👤 USER: " + conn.user.name + "\n" +
                 "  ⏰ TIME: " + time + "\n" +
-                "  🛡️ ANTIDELETE: ACTIVE\n" +
-                "  📸 VIEWONCE:   BYPASS\n" +
-                "  🚫 ANTILINK:   SHIELD ON\n" +
-                "  👀 AUTO-VIEW:  ENABLED\n\n" +
+                `  🛡️ ANTIDELETE: ${features.antidelete ? "ACTIVE" : "OFF"}\n` +
+                `  📸 VIEWONCE:   MANUAL (!vv)\n` +
+                `  🚫 ANTILINK:   ${features.antilink ? "SHIELD ON" : "OFF"}\n` +
+                `  👀 AUTO-VIEW:  ${features.autoview ? "ENABLED" : "OFF"}\n\n` +
                 "  ───────────────────────\n" +
                 "   K N I G H T - L I T E\n" +
                 "  ───────────────────────\n" +
