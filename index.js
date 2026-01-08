@@ -14,8 +14,8 @@ const path = require("path");
 const zlib = require("zlib");
 
 const SESSION_FOLDER = 'session';
-const PREFIX = "!"; 
-const SESSION_ID = process.env.SESSION_ID; 
+const PREFIX = "!";
+const SESSION_ID = process.env.SESSION_ID;
 const logger = pino({ level: 'silent' });
 const msgCache = new Map();
 
@@ -39,7 +39,7 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_FOLDER);
 
     const conn = makeWASocket({
-        logger: logger,
+        logger,
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -57,7 +57,7 @@ async function startBot() {
 
             const from = m.key.remoteJid;
             const isGroup = from.endsWith('@g.us');
-            const sender = isGroup ? m.key.participant : from;
+            const sender = jidNormalizedUser(isGroup ? m.key.participant : from);
             const ownerJid = jidNormalizedUser(conn.user.id);
 
             // 1. AUTO VIEW STATUS
@@ -77,35 +77,54 @@ async function startBot() {
             const type = getContentType(m.message);
             const content = type === 'ephemeralMessage' ? m.message.ephemeralMessage.message : m.message;
             const msgType = getContentType(content);
-            const body = (msgType === 'conversation') ? content.conversation : 
-                         (msgType === 'extendedTextMessage') ? content.extendedTextMessage.text : 
+            const body = (msgType === 'conversation') ? content.conversation :
+                         (msgType === 'extendedTextMessage') ? content.extendedTextMessage.text :
                          (content[msgType]?.caption) ? content[msgType].caption : '';
 
             // 5. ANTILINK LOGIC
             const containsLink = /(https?:\/\/[^\s]+)/g.test(body);
             if (isGroup && containsLink && !m.key.fromMe) {
-                const groupMetadata = await conn.groupMetadata(from);
-                const admins = groupMetadata.participants.filter(p => p.admin).map(p => p.id);
-                if (!admins.includes(sender)) {
-                    if (admins.includes(ownerJid)) {
-                        await conn.sendMessage(from, { delete: m.key });
-                        await conn.sendMessage(from, { text: `🚫 *ANTILINK:* @${sender.split('@')[0]}, links are forbidden.`, mentions: [sender] });
+                try {
+                    const groupMetadata = await conn.groupMetadata(from);
+                    const admins = groupMetadata.participants
+                        .filter(p => p.admin !== null)
+                        .map(p => jidNormalizedUser(p.id));
+
+                    if (!admins.includes(sender)) {
+                        if (admins.includes(ownerJid)) {
+                            await conn.sendMessage(from, { delete: m.key });
+                            await conn.sendMessage(from, {
+                                text: `🚫 *ANTILINK:* @${sender.split('@')[0]}, links are forbidden.`,
+                                mentions: [sender]
+                            });
+                        }
                     }
+                } catch (err) {
+                    console.error("Antilink error:", err);
                 }
             }
 
-            // 6. VIEW-ONCE RETRIEVAL (BUFFER METHOD)
+            // 6. VIEW-ONCE RETRIEVAL
             const isViewOnce = msgType === 'viewOnceMessageV2' || msgType === 'viewOnceMessage';
             if (isViewOnce && !m.key.fromMe) {
                 const viewOnceContent = content[msgType].message;
                 const mediaType = getContentType(viewOnceContent);
-                const buffer = await downloadMediaMessage(m, 'buffer', {}, { logger, reuploadRequest: conn.updateMediaMessage });
+                try {
+                    const buffer = await downloadMediaMessage(
+                        { message: viewOnceContent },
+                        'buffer',
+                        {},
+                        { logger, reuploadRequest: conn.updateMediaMessage }
+                    );
 
-                const caption = `📸 *VIEW-ONCE BYPASS*\n\n*From:* @${sender.split('@')[0]}\n*Type:* ${mediaType}`;
-                if (mediaType === 'imageMessage') {
-                    await conn.sendMessage(ownerJid, { image: buffer, caption, mentions: [sender] });
-                } else if (mediaType === 'videoMessage') {
-                    await conn.sendMessage(ownerJid, { video: buffer, caption, mentions: [sender] });
+                    const caption = `📸 *VIEW-ONCE BYPASS*\n\n*From:* @${sender.split('@')[0]}\n*Type:* ${mediaType}`;
+                    if (mediaType === 'imageMessage') {
+                        await conn.sendMessage(ownerJid, { image: buffer, caption, mentions: [sender] });
+                    } else if (mediaType === 'videoMessage') {
+                        await conn.sendMessage(ownerJid, { video: buffer, caption, mentions: [sender] });
+                    }
+                } catch (err) {
+                    console.error("ViewOnce error:", err);
                 }
             }
 
@@ -127,8 +146,11 @@ async function startBot() {
                 const cachedMsg = msgCache.get(deletedId);
                 if (cachedMsg) {
                     const ownerJid = jidNormalizedUser(conn.user.id);
-                    const sender = cachedMsg.key.participant || cachedMsg.key.remoteJid;
-                    await conn.sendMessage(ownerJid, { text: `🛡️ *DELETED MESSAGE DETECTED*\n*From:* @${sender.split('@')[0]}`, mentions: [sender] });
+                    const sender = jidNormalizedUser(cachedMsg.key.participant || cachedMsg.key.remoteJid);
+                    await conn.sendMessage(ownerJid, {
+                        text: `🛡️ *DELETED MESSAGE DETECTED*\n*From:* @${sender.split('@')[0]}`,
+                        mentions: [sender]
+                    });
                     await conn.sendMessage(ownerJid, { forward: cachedMsg }, { quoted: cachedMsg });
                 }
             }
@@ -141,8 +163,8 @@ async function startBot() {
         if (connection === 'open') {
             const ownerJid = jidNormalizedUser(conn.user.id);
             const time = new Date().toLocaleTimeString();
-            
-            const dashboard = "```" + 
+
+            const dashboard = "```" +
                 "  ⚔️ KNIGHT-LITE ULTRA ⚔️\n" +
                 "  ───────────────────────\n" +
                 "  [ SYSTEM STATUS: ONLINE ]\n\n" +
@@ -156,7 +178,7 @@ async function startBot() {
                 "   K N I G H T - L I T E\n" +
                 "  ───────────────────────\n" +
                 "  TEST: Type !ping```";
-            
+
             await conn.sendMessage(ownerJid, { text: dashboard });
             console.log('✅ KNIGHT-LITE ULTRA CONNECTED');
         }
