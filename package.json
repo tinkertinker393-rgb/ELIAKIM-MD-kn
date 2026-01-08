@@ -1,7 +1,7 @@
 {
   "name": "knight-lite-ultra",
-  "version": "1.2.0",
-  "description": "WhatsApp Bot 2026 - Digital Edition",
+  "version": "1.2.1",
+  "description": "WhatsApp Bot 2026",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,7 +10,6 @@
     "@whiskeysockets/baileys": "6.6.0",
     "@hapi/boom": "^10.0.1",
     "pino": "^8.16.1",
-    "zlib": "^1.0.5",
     "fs-extra": "^11.1.1"
   },
   "engines": {
