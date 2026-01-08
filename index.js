@@ -12,7 +12,6 @@ const msgStore = new Map();
 let lastViewOnce = null;    
 
 async function startBot() {
-    // 1. Session Handling
     const { state, saveCreds } = await useMultiFileAuthState('./session');
 
     const conn = makeWASocket({
@@ -34,7 +33,6 @@ async function startBot() {
             const type = getContentType(m.message);
             const myId = conn.user.id.split(':')[0] + '@s.whatsapp.net';
             
-            // Extract text content reliably
             const msgText = (type === 'conversation') ? m.message.conversation : 
                             (type === 'extendedTextMessage') ? m.message.extendedTextMessage.text : 
                             (type === 'imageMessage' || type === 'videoMessage') ? m.message[type].caption : '';
@@ -51,7 +49,6 @@ async function startBot() {
 
             // --- COMMANDS ---
 
-            // COMMAND: !ping
             if (command === "ping") {
                 const start = Date.now();
                 await conn.sendMessage(from, { text: "🚀 *Knight-Lite is Active...*" }, { quoted: m });
@@ -59,43 +56,35 @@ async function startBot() {
                 await conn.sendMessage(from, { text: `✅ *Pong!* \n\n*Latency:* ${end - start}ms` }, { quoted: m });
             }
 
-            // COMMAND: !vv (Retrieve View Once)
             if (command === "vv") {
-                if (!m.key.fromMe) return; // Only works if YOU send the command
-                if (!lastViewOnce) return await conn.sendMessage(from, { text: "❌ _No View-Once message found in recent memory._" });
-                
+                if (!m.key.fromMe) return; 
+                if (!lastViewOnce) return await conn.sendMessage(from, { text: "❌ _No View-Once message found._" });
                 await conn.sendMessage(myId, { forward: lastViewOnce }, { quoted: m });
                 await conn.sendMessage(from, { text: "📬 _Forwarded to your Private Chat._" });
             }
 
             // --- AUTOMATIONS ---
 
-            // CAPTURE VIEW ONCE (Background)
             const vOnce = m.message?.viewOnceMessageV2 || m.message?.viewOnceMessageV2Extension || m.message?.viewOnceMessage;
             if (vOnce) {
                 lastViewOnce = m;
-                console.log("📸 ViewOnce Captured");
             }
 
-            // ANTI-LINK (Delete links in groups)
             if (from.endsWith('@g.us') && body.match(/chat.whatsapp.com|http/gi) && !m.key.fromMe) {
                 try {
                     const groupMetadata = await conn.groupMetadata(from);
                     const isBotAdmin = groupMetadata.participants.find(p => p.id === myId)?.admin;
-                    if (isBotAdmin) {
-                        await conn.sendMessage(from, { delete: m.key });
-                    }
-                } catch (e) { /* Bot not admin or metadata error */ }
+                    if (isBotAdmin) await conn.sendMessage(from, { delete: m.key });
+                } catch (e) {}
             }
 
-            // CACHE FOR ANTI-DELETE (Keep last 500 messages)
             msgStore.set(m.key.id, m);
             if (msgStore.size > 500) msgStore.delete(msgStore.keys().next().value);
 
         } catch (err) { console.error("Error in handler:", err); }
     });
 
-    // --- ANTI-DELETE LOGIC ---
+    // --- ANTI-DELETE ---
     conn.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             if (update.update.protocolMessage?.type === 0) {
@@ -103,29 +92,35 @@ async function startBot() {
                 if (deletedMsg) {
                     const myId = conn.user.id.split(':')[0] + '@s.whatsapp.net';
                     const sender = (deletedMsg.key.participant || deletedMsg.key.remoteJid).split('@')[0];
-                    
-                    console.log(`⚠️ Delete detected from: ${sender}`);
-                    
                     await conn.sendMessage(myId, { 
                         text: `⚠️ *ANTI-DELETE DETECTED*\n\n*User:* @${sender}\n*Chat:* ${update.key.remoteJid.endsWith('@g.us') ? "Group" : "Private"}`,
                         mentions: [deletedMsg.key.participant || deletedMsg.key.remoteJid]
                     });
-                    
-                    // Send the deleted content
                     await conn.sendMessage(myId, { forward: deletedMsg });
                 }
             }
         }
     });
 
-    // Connection Logic
-    conn.ev.on('connection.update', (update) => {
+    // --- CONNECTION UPDATE (Notification Added Here) ---
+    conn.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
+        
         if (connection === 'close') {
             const shouldRestart = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldRestart) startBot();
         } else if (connection === 'open') {
-            console.log('✅ Knight-Lite is Online! Prefix: ' + prefix);
+            console.log('✅ Knight-Lite is Online!');
+
+            // SEND NOTIFICATION TO YOUR DM
+            const myId = conn.user.id.split(':')[0] + '@s.whatsapp.net';
+            const statusMessage = `☠️ *Knight-Lite Ultra Connected!*\n\n` +
+                                 `📅 *Date:* ${new Date().toLocaleString()}\n` +
+                                 `🛠 *Prefix:* ${prefix}\n` +
+                                 `🔄 *Status:* Running Nonstop\n\n` +
+                                 `_Bot is now monitoring messages and anti-delete is active._`;
+            
+            await conn.sendMessage(myId, { text: statusMessage });
         }
     });
 }
