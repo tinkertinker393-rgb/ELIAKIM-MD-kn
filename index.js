@@ -7,113 +7,130 @@ const {
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const { Boom } = require("@hapi/boom");
-const fs = require("fs");
+const fs = require("fs-extra");
 const path = require("path");
 const zlib = require("zlib");
 
-// --- CONFIGURATION ---
 const SESSION_FOLDER = 'session';
-const PREFIX = "!";
-// Your Session ID provided
-const SESSION_ID = "KEITH;;;H4sIAAAAAAAAA5VU2Y6jOBT9F78manZCkEoatgSyEFLZIKN5MGAIFbayDYRq5d9HpLq6WiNNTw1PxrbuPfcs/g7KKiNoiXqgfgc1zlpI0bCkfY2ACvQmSRAGYxBDCoEKqvmVwsWJJ1xesi9apRTLw9H2WjNpeGZGT3P51nKBZtp++gTuY1A3YZ5FvynodKwRrYLzqOsKJ+C5EHP8cractr61CF07bEcjRjuK1Xm3fgL3oSLMcFamVn1BBcIwX6Legxn+GvzCDTDD6PMgVyYSw7qTfhcysuTMWyhMpvVz0h0tAW9oIURfg/864wNvFnN8WrvmprSf3ybPXZg3Gw5KFnVeREOb0DCrKae9wydZWqLYiVFJM9p/mfeD1ZxHoSFtyJy/NPS5FrfTw2XeQHoxkgw2zHNlek2W0FP1NeBv0vHl4Gz2u8tkNytTHJ63WNNl91Wmq2T25kXOaoVSa7rlul+Be/jDK9f/w/vVs8XDbhEG5mlGGYqrgyR7xhUaR46tUmk094Ua+/aIKYKvwccHX3itvLWzer75bgtfnJ4NmNEyNhdXS5/z7iq4eA4fWCfyCR/SBv/W3OnVnx5ssr5NaKG5V2OjrC+uM4fygV7waLWSW+yjaL1cbepNeL2wnZTtjfNrolP+todsQ+kyRoZtHv2pDrW1ac8YvXt6THRFvRMDlbuPAUZpRiiGNKvKYY/nuDGAcbtDEUb0QS9o/AOrGOVWb49CbBeLupXlm8fgJi5PRXAIcsXOdnkpM5frExiDGlcRIgTFdkZohfs1IgSmiAD1z7/GoEQ3+i7c0E7gxiDJMKGHsqnzCsYfqn4cwiiqmpLu+jIyhgXCQGU/txGlWZmSgcemhDi6ZC0yLpASoCYwJ+jnhAijGKgUN+hnao0qHohnrbXrGcoZjEHxECSLgQp4SZyIssiKLKuonPAH+dYNZWFdfysRBWOQv1/jBUGROVlUOEERHjeHg/tPhEPBGFGY5QSowHB2M0VhLctbWgyp5nPNSTUj1cDnRB/WeKeeCm/iduEa3XHaGftQ8OB11zWEeN5ExCvdR5nuOpZxK68P6v9ZBKigsyrPYsxaS6k3X+SxdDHdbvJKWJkWot0nnO7jwPTX69ARDsJryRgX+WVpuY2y4MibpItm0vW0jYq2jnWfM188LBna09AtRm0WoV+bMc/SWZ71nnOAJ32xGnldOedQsQ1Mvmwro9Cym/ii7/z5wi2D6KQv1lFbFLNtRkaaZgZxFNnCFO2PfV+GofKq5+k6Mbfvpn2EJv/xWGUPOw1aDb9Jhh7ZL+Gg4H9r9w58sBh7H/9S48dr8i+J1MNYGVnGfktmSaRd+ekbX1tkhVfm22i07LujUKX7na6Rs7QA9/tfY1DnkCYVLoAKYBnjKovBGOCqGTzrlEn1m2aG7jjmNjWGyXNIqPaZg31WIEJhUQOVm8gTRZ6wrPh+y8NVbUNyASrwTldJHzzda3W9o5B+pApow+dUFNz/BtpFT/1xBwAA";
+const PREFIX = "!"; 
+const SESSION_ID = process.env.SESSION_ID; 
 
-/**
- * Decodes the Session ID string and creates the credentials file.
- */
-function restoreSession() {
-    if (!fs.existsSync(SESSION_FOLDER)) {
-        fs.mkdirSync(SESSION_FOLDER);
-    }
+const msgCache = new Map();
+
+async function restoreSession() {
+    await fs.ensureDir(SESSION_FOLDER);
     const credsPath = path.join(SESSION_FOLDER, 'creds.json');
     
-    // Only create if it doesn't exist to prevent overwriting active sessions
-    if (!fs.existsSync(credsPath)) {
+    // Only restore from SESSION_ID if local creds don't exist
+    if (!fs.existsSync(credsPath) && SESSION_ID) {
         try {
             const base64Data = SESSION_ID.split(';;;')[1];
             const buffer = Buffer.from(base64Data, 'base64');
             const decompressed = zlib.gunzipSync(buffer);
-            fs.writeFileSync(credsPath, decompressed);
-            console.log("✅ Session restored from ID successfully.");
-        } catch (e) {
-            console.error("❌ Failed to restore session ID:", e.message);
+            await fs.writeFile(credsPath, decompressed);
+            console.log("✅ Credentials Decoded from SESSION_ID.");
+        } catch (e) { 
+            console.log("❌ SESSION_ID invalid.");
         }
     }
 }
 
-function getMessageBody(m) {
-    if (!m.message) return '';
-    const type = getContentType(m.message);
-    if (type === 'protocolMessage' || type === 'senderKeyDistributionMessage') return '';
-    if (type === 'conversation') return m.message.conversation;
-    if (type === 'extendedTextMessage') return m.message.extendedTextMessage.text;
-    if (m.message[type]?.caption) return m.message[type].caption;
-    if (type === 'viewOnceMessageV2' && m.message.viewOnceMessageV2.message) {
-        return getMessageBody({ message: m.message.viewOnceMessageV2.message });
-    }
-    return '';
-}
-
 async function startBot() {
-    // Step 1: Restore session before initializing auth
-    restoreSession();
-
+    await restoreSession();
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_FOLDER);
 
     const conn = makeWASocket({
-        logger: pino({ level: 'silent' }), 
+        logger: pino({ level: 'silent' }),
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
         },
-        browser: ["Knight-Lite", "Chrome", "3.0.0"],
-        printQRInTerminal: true,
-        shouldSyncHistoryMessage: () => false,
-        syncFullHistory: false,
-        markOnlineOnConnect: true
+        browser: ["Knight-Lite", "Chrome", "121.0.0"],
+        markOnlineOnConnect: true,
+        shouldSyncHistoryMessage: () => false
     });
 
     conn.ev.on('creds.update', saveCreds);
 
     conn.ev.on('messages.upsert', async (chatUpdate) => {
         try {
-            if (chatUpdate.type !== 'notify') return;
             const m = chatUpdate.messages[0];
-            if (!m.message || m.key.fromMe) return;
+            if (!m.message) return;
 
             const from = m.key.remoteJid;
-            const body = getMessageBody(m);
-            const isGroup = from.endsWith('@g.us');
-            const senderName = m.pushName || 'User';
+            const ownerJid = conn.user.id.split(':')[0] + '@s.whatsapp.net';
 
+            // 1. AUTO VIEW STATUS
+            if (from === 'status@broadcast') {
+                await conn.readMessages([m.key]);
+                return;
+            }
+
+            // Cache for Antidelete
+            msgCache.set(m.key.id, m);
+            setTimeout(() => msgCache.delete(m.key.id), 600000);
+
+            // 2. ALWAYS TYPING (Only for others to save resources)
+            if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
+
+            const type = getContentType(m.message);
+            const body = (type === 'conversation') ? m.message.conversation : (type === 'extendedTextMessage') ? m.message.extendedTextMessage.text : (m.message[type]?.caption) ? m.message[type].caption : '';
+
+            // 3. AUTO VV REDIRECT TO DM
+            const vv = m.message.viewOnceMessageV2?.message || m.message.viewOnceMessage?.message;
+            if (vv && !m.key.fromMe) {
+                await conn.sendMessage(ownerJid, { text: `📸 *VV DETECTED*\nFrom: @${(m.key.participant || from).split('@')[0]}`, mentions: [m.key.participant || from] });
+                await conn.sendMessage(ownerJid, { forward: { message: vv, key: m.key } });
+            }
+
+            // 4. COMMANDS (Allows testing !ping from your own phone)
             if (body.startsWith(PREFIX)) {
                 const args = body.slice(PREFIX.length).trim().split(/\s+/);
                 const command = args.shift().toLowerCase();
 
-                switch (command) {
-                    case "ping":
-                        return await conn.sendMessage(from, { text: `☠️ *Knight-Lite Ultra* is online!` }, { quoted: m });
-                    case "alive":
-                        return await conn.sendMessage(from, { text: "System active and reading commands. ✅" }, { quoted: m });
-                    case "help":
-                        return await conn.sendMessage(from, { text: `*Commands:* !ping, !alive, !status, !echo` }, { quoted: m });
+                if (command === "ping") {
+                    await conn.sendMessage(from, { text: "☠️ *Knight-Lite Ultra is online*" }, { quoted: m });
                 }
             }
-        } catch (err) {
-            console.error("Listener Error: ", err);
+        } catch (err) { console.error(err); }
+    });
+
+    // 5. ANTIDELETE LISTENER
+    conn.ev.on('messages.update', async (updates) => {
+        for (const update of updates) {
+            if (update.update.protocolMessage?.type === 3) {
+                const cached = msgCache.get(update.update.protocolMessage.key.id);
+                if (cached) {
+                    const ownerJid = conn.user.id.split(':')[0] + '@s.whatsapp.net';
+                    const sender = cached.key.participant || cached.key.remoteJid;
+                    await conn.sendMessage(ownerJid, { text: `🛡️ *DELETED MSG*\nFrom: @${sender.split('@')[0]}`, mentions: [sender] });
+                    await conn.sendMessage(ownerJid, { forward: cached });
+                }
+            }
         }
     });
 
-    conn.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'close') {
-            const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            if (reason !== DisconnectReason.loggedOut) {
-                startBot();
-            }
-        } else if (connection === 'open') {
-            console.log('✅ BOT ONLINE AND CONNECTED');
+    // 6. STARTUP DM
+    conn.ev.on('connection.update', async (u) => {
+        if (u.connection === 'open') {
+            const ownerJid = conn.user.id.split(':')[0] + '@s.whatsapp.net';
+            const digitalMsg = "```" + 
+                "╔════════════════════════╗\n" +
+                "║   KNIGHT-LITE ULTRA    ║\n" +
+                "║       CONNECTED        ║\n" +
+                "╚════════════════════════╝\n\n" +
+                "STATUS: ACTIVE ✅\n" +
+                "TEST: Type !ping\n\n" +
+                "ANTIDELETE: DM ENABLED\n" +
+                "VIEWONCE: DM ENABLED\n" +
+                "AUTO-STATUS: ACTIVE```";
+            await conn.sendMessage(ownerJid, { text: digitalMsg });
+            console.log('✅ BOT READY');
+        }
+        if (u.connection === 'close') {
+            if (new Boom(u.lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut) startBot();
         }
     });
 }
 
-startBot().catch(err => console.log("Critical Start Error:", err));
+startBot();
