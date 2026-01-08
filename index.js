@@ -16,6 +16,8 @@ const SESSION_FOLDER = 'session';
 const PREFIX = "!"; 
 const SESSION_ID = process.env.SESSION_ID; 
 
+// This map stores every message the bot sees.
+// If a message is deleted later, we grab it from here.
 const msgCache = new Map();
 
 async function restoreSession() {
@@ -23,14 +25,12 @@ async function restoreSession() {
     const credsPath = path.join(SESSION_FOLDER, 'creds.json');
     if (!fs.existsSync(credsPath) && SESSION_ID) {
         try {
-            const base64Data = SESSION_ID.split(';;;')[1] || SESSION_ID;
+            const base64Data = SESSION_ID.includes(';;;') ? SESSION_ID.split(';;;')[1] : SESSION_ID;
             const buffer = Buffer.from(base64Data, 'base64');
             const decompressed = zlib.gunzipSync(buffer);
             await fs.writeFile(credsPath, decompressed);
-            console.log("✅ Credentials Decoded from SESSION_ID.");
-        } catch (e) { 
-            console.log("❌ SESSION_ID invalid.");
-        }
+            console.log("✅ Session Restored.");
+        } catch (e) { console.log("❌ SESSION_ID error."); }
     }
 }
 
@@ -46,115 +46,107 @@ async function startBot() {
         },
         browser: ["Knight-Lite", "Chrome", "121.0.0"],
         markOnlineOnConnect: true,
-        generateHighQualityLinkPreview: true
     });
 
     conn.ev.on('creds.update', saveCreds);
 
+    // --- 1. HANDLING NEW MESSAGES ---
     conn.ev.on('messages.upsert', async (chatUpdate) => {
         try {
             const m = chatUpdate.messages[0];
             if (!m.message) return;
 
             const from = m.key.remoteJid;
-            const isGroup = from.endsWith('@g.us');
-            const sender = isGroup ? m.key.participant : from;
             const ownerJid = jidNormalizedUser(conn.user.id);
+            const sender = m.key.participant || m.key.remoteJid;
 
-            // 1. AUTO VIEW STATUS (Fixed)
+            // AUTO-VIEW STATUS
             if (from === 'status@broadcast') {
                 await conn.readMessages([m.key]);
-                console.log(` Viewed status from: ${m.pushName || sender.split('@')[0]}`);
                 return;
             }
 
-            // Cache for Antidelete (Stores the actual message object)
-            msgCache.set(m.key.id, m);
-            if (msgCache.size > 1000) msgCache.delete(msgCache.keys().next().value); // Prevent memory leak
+            // --- DEEP MESSAGE PARSING ---
+            // We dig through layers: Ephemeral -> ViewOnce -> Content
+            let messageType = getContentType(m.message);
+            let msgContent = m.message;
 
-            // 2. ALWAYS TYPING
-            if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
-
-            // Helper to get actual message content (Handles Ephemeral/ViewOnce wrappers)
-            const msgType = getContentType(m.message);
-            const content = msgType === 'ephemeralMessage' ? m.message.ephemeralMessage.message : m.message;
-            const type = getContentType(content);
-            
-            const body = (type === 'conversation') ? content.conversation : 
-                         (type === 'extendedTextMessage') ? content.extendedTextMessage.text : 
-                         (content[type]?.caption) ? content[type].caption : '';
-
-            // 3. AUTO VIEW-ONCE REDIRECT (Fixed)
-            const isViewOnce = type === 'viewOnceMessage' || type === 'viewOnceMessageV2';
-            if (isViewOnce && !m.key.fromMe) {
-                const viewOnceContent = content[type].message;
-                const vvType = getContentType(viewOnceContent);
-                
-                await conn.sendMessage(ownerJid, { 
-                    text: `📸 *VIEW-ONCE DETECTED*\n\n*From:* @${sender.split('@')[0]}\n*Type:* ${vvType}`, 
-                    mentions: [sender] 
-                });
-                
-                // Forward the secret content
-                await conn.sendMessage(ownerJid, { forward: { message: viewOnceContent, key: m.key } }, { quoted: m });
+            if (messageType === 'ephemeralMessage') {
+                msgContent = msgContent.ephemeralMessage.message;
+                messageType = getContentType(msgContent);
             }
 
-            // 4. COMMANDS
+            let isViewOnce = false;
+            if (messageType === 'viewOnceMessageV2' || messageType === 'viewOnceMessage') {
+                isViewOnce = true;
+                msgContent = msgContent[messageType].message;
+                messageType = getContentType(msgContent);
+            }
+
+            // CACHE FOR ANTI-DELETE: Store message so we can recover it later
+            msgCache.set(m.key.id, m);
+            if (msgCache.size > 1000) msgCache.delete(msgCache.keys().next().value);
+
+            // ALWAYS TYPING
+            if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
+
+            // AUTO-VIEWONCE FORWARDING
+            if (isViewOnce && !m.key.fromMe) {
+                await conn.sendMessage(ownerJid, { 
+                    text: `📸 *VIEW-ONCE DETECTED*\n*From:* @${sender.split('@')[0]}`, 
+                    mentions: [sender] 
+                });
+                await conn.sendMessage(ownerJid, { forward: { message: msgContent, key: m.key } });
+            }
+
+            // COMMANDS (Ping)
+            const body = (messageType === 'conversation') ? msgContent.conversation : 
+                         (messageType === 'extendedTextMessage') ? msgContent.extendedTextMessage.text : 
+                         (msgContent[messageType]?.caption) ? msgContent[messageType].caption : '';
+
             if (body.startsWith(PREFIX)) {
                 const args = body.slice(PREFIX.length).trim().split(/\s+/);
                 const command = args.shift().toLowerCase();
-
                 if (command === "ping") {
                     await conn.sendMessage(from, { text: "☠️ *Knight-Lite Ultra is online*" }, { quoted: m });
                 }
             }
-        } catch (err) { console.error("Error in upsert:", err); }
+        } catch (err) { console.error("Upsert Error:", err); }
     });
 
-    // 5. ANTIDELETE LISTENER (Fixed)
+    // --- 2. THE ANTI-DELETE LISTENER (Delete for Everyone) ---
     conn.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
-            if (update.update.protocolMessage && update.update.protocolMessage.type === 0) { // type 0 is REVOKE (Delete)
-                const deletedKey = update.update.protocolMessage.key;
-                const cachedMsg = msgCache.get(deletedKey.id);
+            // protocolMessage type 0 = "Delete for Everyone" (Revoke)
+            if (update.update.protocolMessage?.type === 0) {
+                const deletedMsgId = update.update.protocolMessage.key.id;
+                const originalMsg = msgCache.get(deletedMsgId);
 
-                if (cachedMsg) {
+                if (originalMsg) {
                     const ownerJid = jidNormalizedUser(conn.user.id);
-                    const sender = cachedMsg.key.participant || cachedMsg.key.remoteJid;
-                    
+                    const sender = originalMsg.key.participant || originalMsg.key.remoteJid;
+
                     await conn.sendMessage(ownerJid, { 
-                        text: `🛡️ *DELETED MESSAGE DETECTED*\n\n*From:* @${sender.split('@')[0]}\n*Chat:* ${cachedMsg.key.remoteJid}`, 
+                        text: `🛡️ *DELETED FOR EVERYONE*\n\n*From:* @${sender.split('@')[0]}\n*Chat:* ${originalMsg.key.remoteJid}`, 
                         mentions: [sender] 
                     });
-                    
-                    // Forward the cached message back to you
-                    await conn.sendMessage(ownerJid, { forward: cachedMsg }, { quoted: cachedMsg });
+
+                    // Send the deleted message back to you
+                    await conn.sendMessage(ownerJid, { forward: originalMsg });
+                    msgCache.delete(deletedMsgId); // Clear it from memory
                 }
             }
         }
     });
 
-    // 6. STARTUP DM
-    conn.ev.on('connection.update', async (u) => {
-        const { connection, lastDisconnect } = u;
-        if (connection === 'open') {
+    conn.ev.on('connection.update', (u) => {
+        if (u.connection === 'open') {
             const ownerJid = jidNormalizedUser(conn.user.id);
-            const digitalMsg = "```" + 
-                "╔════════════════════════╗\n" +
-                "║   KNIGHT-LITE ULTRA    ║\n" +
-                "║       CONNECTED        ║\n" +
-                "╚════════════════════════╝\n\n" +
-                "STATUS: ACTIVE ✅\n" +
-                "TEST: Type !ping\n\n" +
-                "ANTIDELETE: ENABLED 🛡️\n" +
-                "VIEWONCE: DM ENABLED 📸\n" +
-                "AUTO-STATUS: ACTIVE 👀```";
-            await conn.sendMessage(ownerJid, { text: digitalMsg });
+            conn.sendMessage(ownerJid, { text: "✅ *KNIGHT-LITE ULTRA CONNECTED*\n\nAntidelete: Active\nView-Once: Active\nStatus-View: Active" });
             console.log('✅ BOT READY');
         }
-        if (connection === 'close') {
-            const shouldReconnect = (new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut);
-            if (shouldReconnect) startBot();
+        if (u.connection === 'close') {
+            if (new Boom(u.lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut) startBot();
         }
     });
 }
