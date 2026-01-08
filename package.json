@@ -1,18 +1,19 @@
 {
   "name": "knight-lite-ultra",
-  "version": "1.1.0",
-  "description": "WhatsApp Bot with Anti-Delete, Anti-Link, and View-Once Recovery",
+  "version": "1.2.0",
+  "description": "WhatsApp Bot 2026 - Digital Edition",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "latest",
+    "@whiskeysockets/baileys": "6.6.0",
     "@hapi/boom": "^10.0.1",
-    "pino": "^9.0.0"
+    "pino": "^8.16.1",
+    "zlib": "^1.0.5",
+    "fs-extra": "^11.1.1"
   },
   "engines": {
     "node": ">=20.0.0"
-  },
-  "license": "MIT"
+  }
 }
