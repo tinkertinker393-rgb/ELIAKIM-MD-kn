@@ -36,4 +36,4 @@ jobs:
           commit_message: "Sync Session Data [Knight-Lite]"
           file_pattern: 'session/*.json'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WAZIMU }}
