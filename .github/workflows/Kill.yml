@@ -4,19 +4,20 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: '0 */5 * * *' # Backup trigger every 5 hours
-  workflow_dispatch:      # Allows manual start
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: knight-lite-run
-  cancel-in-progress: true # This kills the old run if a new one starts
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 310 # Total job limit (5 hours + 10 mins buffer)
+    timeout-minutes: 315
     permissions:
       contents: write
+      actions: write
 
     steps:
       - uses: actions/checkout@v4
@@ -24,13 +25,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          # No cache here to avoid the "lock file not found" error
 
-      - run: npm install
+      - name: Install Dependencies
+        run: npm install
       
       - name: Run Bot
-        # Run for 300 minutes (5 hours)
-        run: timeout 300m node index.js || echo "Cycle ending..."
+        # Run for 5 hours (300 mins)
+        run: timeout 300m node index.js || echo "Bot session ended."
         env:
           SESSION_ID: ${{ secrets.SESSION_ID }}
 
@@ -39,15 +41,19 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Sync Session Data [Knight-Lite]"
-          file_pattern: 'session/*.json'
+          # This pattern captures the folder even if the bot just created it
+          file_pattern: 'session/*' 
         env:
           GITHUB_TOKEN: ${{ secrets.WAZIMU }}
 
       - name: Trigger Next Loop
         if: always()
         run: |
+          # This line automatically finds the current filename to prevent 404 errors
+          WORKFLOW_SEP=$(echo "${{ github.workflow_ref }}" | awk -F'@' '{print $1}' | awk -F'/' '{print $NF}')
+          
           curl -X POST \
           -H "Authorization: token ${{ secrets.WAZIMU }}" \
           -H "Accept: application/vnd.github.v3+json" \
-          https://api.github.com/repos/${{ github.repository }}/actions/workflows/kill.yml/dispatches \
-          -d '{"ref":"main"}'
+          https://api.github.com/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_SEP}/dispatches \
+          -d '{"ref":"${{ github.ref_name }}"}'
