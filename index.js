@@ -4,38 +4,60 @@ const {
     DisconnectReason,
     getContentType,
     makeCacheableSignalKeyStore,
-    jidNormalizedUser,
-    downloadMediaMessage
+    jidNormalizedUser
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const { Boom } = require("@hapi/boom");
 const fs = require("fs-extra");
 const path = require("path");
 const zlib = require("zlib");
+const os = require("os");
 
+// --- CONFIGURATION ---
 const SESSION_FOLDER = 'session';
+const SETTINGS_FILE = 'settings.json';
+const SESSION_ID = process.env.SESSION_ID; // Your Session ID
+const OWNER_NUMBER = "254746404008";     // Your specific number
 const PREFIX = "!";
-const SESSION_ID = process.env.SESSION_ID;
 const logger = pino({ level: 'silent' });
-const msgCache = new Map();
 
-// Feature toggles
-const features = {
-    antilink: true,
-    antidelete: true,
-    autoview: true
+// --- MEMORY & SETTINGS ---
+const msgCache = new Map();
+const startTime = Date.now();
+
+let botSettings = {
+    antilink: { status: 'delete' }, // Always On by default
+    antidelete: { status: true, notification: ' *Eliakim MD Anti-Delete* 🇰🇪' },
+    autostatus: { autoview: true, autolike: true }
 };
 
-// Pretty logger
-function logEvent(type, details) {
-    const time = new Date().toLocaleTimeString();
-    console.log(
-        `\n──────────────────────────────\n` +
-        `⏰ ${time}\n` +
-        `📌 EVENT: ${type}\n` +
-        `🔎 DETAILS: ${details}\n` +
-        `──────────────────────────────\n`
-    );
+// Load saved settings if they exist
+if (fs.existsSync(SETTINGS_FILE)) {
+    botSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+}
+const saveSettings = () => fs.writeFileSync(SETTINGS_FILE, JSON.stringify(botSettings, null, 2));
+
+// --- CODING QUOTES ---
+const codingQuotes = [
+    "“First, solve the problem. Then, write the code.” – John Johnson",
+    "“Code is like humor. When you have to explain it, it’s bad.” – Cory House",
+    "“Fix the cause, not the symptom.” – Steve Maguire",
+    "“Java is to JavaScript what car is to Carpet.” – Chris Heilmann",
+    "“Knowledge is power.” – Francis Bacon",
+    "“Sometimes it pays to stay in bed on Monday, rather than debugging Monday’s code.” – Dan Salomon",
+    "“Perfection is attained not when there is nothing more to add, but when there is nothing more to remove.”",
+    "“Before software can be reusable it first has to be usable.” – Ralph Johnson",
+    "“Computers are good at following instructions, but not at reading your mind.”",
+    "“The best thing about a boolean is even if you are wrong, you are only off by a bit.”"
+];
+
+// --- UTILS ---
+function runtime() {
+    const seconds = Math.floor((Date.now() - startTime) / 1000);
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    return `${h}h ${m}m ${s}s`;
 }
 
 async function restoreSession() {
@@ -48,8 +70,7 @@ async function restoreSession() {
             let decoded;
             try { decoded = zlib.gunzipSync(buffer); } catch { decoded = buffer; }
             await fs.writeFile(credsPath, decoded);
-            console.log("✅ Session Restored.");
-        } catch (e) { console.log("❌ Session ID error."); }
+        } catch (e) { console.log("❌ Session Restore Error"); }
     }
 }
 
@@ -63,11 +84,22 @@ async function startBot() {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
-        browser: ["Knight-Lite", "Chrome", "121.0.0"],
+        browser: ["Eliakim MD ☠️🇰🇪", "Chrome", "1.0.0"],
         markOnlineOnConnect: true
     });
 
     conn.ev.on('creds.update', saveCreds);
+
+    // --- 3-HOUR QUOTE TIMER ---
+    setInterval(async () => {
+        try {
+            const ownerJid = OWNER_NUMBER + "@s.whatsapp.net";
+            const quote = codingQuotes[Math.floor(Math.random() * codingQuotes.length)];
+            await conn.sendMessage(ownerJid, { 
+                text: `💻 *ELIAKIM MD CODING QUOTE* 🇰🇪\n\n${quote}\n\n_Next quote in 3 hours..._` 
+            });
+        } catch (e) {}
+    }, 3 * 60 * 60 * 1000);
 
     conn.ev.on('messages.upsert', async ({ messages }) => {
         try {
@@ -77,9 +109,12 @@ async function startBot() {
             const from = m.key.remoteJid;
             const isGroup = from.endsWith('@g.us');
             const sender = jidNormalizedUser(isGroup ? m.key.participant : from);
-            const ownerJid = jidNormalizedUser(conn.user.id);
+            const isOwner = sender.startsWith(OWNER_NUMBER) || m.key.fromMe;
+            const botNumber = jidNormalizedUser(conn.user.id);
 
-            // Log incoming message
+            // 1. ALWAYS TYPING
+            if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
+
             const type = getContentType(m.message);
             const content = type === 'ephemeralMessage' ? m.message.ephemeralMessage.message : m.message;
             const msgType = getContentType(content);
@@ -87,158 +122,99 @@ async function startBot() {
                          (msgType === 'extendedTextMessage') ? content.extendedTextMessage.text :
                          (content[msgType]?.caption) ? content[msgType].caption : '';
 
-            console.log(`💬 Message from ${sender} (${isGroup ? "Group" : "Private"}): ${body}`);
-
-            // 1. AUTO VIEW STATUS
-            if (features.autoview && from === 'status@broadcast') {
+            // 2. AUTO STATUS (VIEW & LIKE)
+            if (from === 'status@broadcast') {
                 await conn.readMessages([m.key]);
-                logEvent("AUTOVIEW", `Viewed status from ${sender}`);
+                const statusEmojis = ['💛', '❤️', '💜', '🤍', '💙', '🇰🇪', '🔥'];
+                const emoji = statusEmojis[Math.floor(Math.random() * statusEmojis.length)];
+                await conn.sendMessage(from, { react: { key: m.key, text: emoji } }, { statusJidList: [m.key.participant, botNumber] });
                 return;
             }
 
-            // 2. CACHE FOR ANTIDELETE
-            msgCache.set(m.key.id, m);
-            if (msgCache.size > 1000) msgCache.delete(msgCache.keys().next().value);
-
-            // 3. ALWAYS TYPING
-            if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
-
-            // 4. ANTILINK LOGIC
-            const containsLink = /(https?:\/\/[^\s]+)/g.test(body);
-            if (features.antilink && isGroup && containsLink && !m.key.fromMe) {
-                try {
-                    const groupMetadata = await conn.groupMetadata(from);
-                    const admins = groupMetadata.participants
-                        .filter(p => p.admin !== null)
-                        .map(p => jidNormalizedUser(p.id));
-
-                    if (!admins.includes(sender)) {
-                        if (admins.includes(ownerJid)) {
-                            await conn.sendMessage(from, { delete: m.key });
-                            await conn.sendMessage(from, {
-                                text: `🚫 *ANTILINK:* @${sender.split('@')[0]}, links are forbidden.`,
-                                mentions: [sender]
-                            });
-                            logEvent("ANTILINK", `Blocked link from ${sender} in ${from}`);
-                        }
-                    }
-                } catch (err) {
-                    console.error("Antilink error:", err);
-                }
-            }
-
-            // 5. COMMANDS
+            // 3. COMMANDS
             if (body.startsWith(PREFIX)) {
                 const args = body.slice(PREFIX.length).trim().split(/\s+/);
                 const command = args[0].toLowerCase();
-                console.log(`⚔️ Command: ${command} from ${sender}`);
 
                 switch (command) {
                     case "ping":
-                        await conn.sendMessage(from, { text: "☠️ *Knight-Lite Ultra is online*" }, { quoted: m });
+                        const start = Date.now();
+                        await conn.sendMessage(from, { react: { text: "☠️", key: m.key } });
+                        const end = Date.now();
+                        await conn.sendMessage(from, { 
+                            text: `*Eliakim MD ☠️🇰🇪 Pong!*\n\n*Latency:* ${end - start}ms\n*Runtime:* ${runtime()}\n*RAM:* ${(os.freemem() / 1024 / 1024).toFixed(0)}MB / ${(os.totalmem() / 1024 / 1024).toFixed(0)}MB` 
+                        }, { quoted: m });
                         break;
 
                     case "antilink":
-                        if (args[1] === "on") features.antilink = true;
-                        if (args[1] === "off") features.antilink = false;
-                        await conn.sendMessage(from, { text: `🚫 Antilink is now *${features.antilink ? "ON" : "OFF"}*` }, { quoted: m });
-                        break;
-
-                    case "antidelete":
-                        if (args[1] === "on") features.antidelete = true;
-                        if (args[1] === "off") features.antidelete = false;
-                        await conn.sendMessage(from, { text: `🛡️ Antidelete is now *${features.antidelete ? "ON" : "OFF"}*` }, { quoted: m });
-                        break;
-
-                    case "autoview":
-                        if (args[1] === "on") features.autoview = true;
-                        if (args[1] === "off") features.autoview = false;
-                        await conn.sendMessage(from, { text: `👀 Auto-view status is now *${features.autoview ? "ON" : "OFF"}*` }, { quoted: m });
-                        break;
-
-                    case "vv":
-                        const quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-                        const quotedSender = m.message?.extendedTextMessage?.contextInfo?.participant;
-
-                        if (!quoted) break;
-
-                        const qType = getContentType(quoted);
-                        if (qType === 'viewOnceMessageV2' || qType === 'viewOnceMessage') {
-                            const viewOnceContent = quoted[qType].message;
-                            const mediaType = getContentType(viewOnceContent);
-
-                            try {
-                                const buffer = await downloadMediaMessage(
-                                    { message: viewOnceContent },
-                                    'buffer',
-                                    {},
-                                    { logger, reuploadRequest: conn.updateMediaMessage }
-                                );
-
-                                const caption = `📸 *VIEW-ONCE SAVED*\n\n*From:* @${quotedSender.split('@')[0]}\n*Type:* ${mediaType}`;
-                                if (mediaType === 'imageMessage') {
-                                    await conn.sendMessage(ownerJid, { image: buffer, caption, mentions: [quotedSender] });
-                                } else if (mediaType === 'videoMessage') {
-                                    await conn.sendMessage(ownerJid, { video: buffer, caption, mentions: [quotedSender] });
-                                }
-                                logEvent("VIEW-ONCE", `Saved view-once from ${quotedSender} → sent to owner DM`);
-                            } catch (err) {
-                                console.error("VV command error:", err);
-                            }
+                        if (!isOwner) return;
+                        if (args[1] === "on") {
+                            botSettings.antilink.status = 'delete';
+                            saveSettings();
+                            await conn.sendMessage(from, { text: "🛡️ *Anti-Link is now ALWAYS ON.*" });
+                        } else if (args[1] === "off") {
+                            botSettings.antilink.status = 'off';
+                            saveSettings();
+                            await conn.sendMessage(from, { text: "🔓 *Anti-Link is now OFF.*" });
                         }
                         break;
 
-                    default:
-                        await conn.sendMessage(from, { text: "❓ Unknown command. Type !help for options." }, { quoted: m });
+                    case "tagall":
+                        if (!isGroup || !isOwner) return;
+                        const group = await conn.groupMetadata(from);
+                        let msg = `*📢 ELIAKIM MD TAGALL*\n\n`;
+                        for (let i of group.participants) msg += ` @${i.id.split('@')[0]}`;
+                        await conn.sendMessage(from, { text: msg, mentions: group.participants.map(a => a.id) });
+                        break;
                 }
             }
+
+            // 4. ANTI-LINK (Always On / Delete Only)
+            const linkRegex = /(https?:\/\/[^\s]+)/g;
+            if (botSettings.antilink.status === 'delete' && isGroup && linkRegex.test(body) && !m.key.fromMe) {
+                const groupMetadata = await conn.groupMetadata(from);
+                const admins = groupMetadata.participants.filter(p => p.admin !== null).map(p => jidNormalizedUser(p.id));
+                if (!admins.includes(sender) && admins.includes(botNumber)) {
+                    await conn.sendMessage(from, { delete: m.key });
+                }
+            }
+
+            // 5. CACHE FOR ANTI-DELETE
+            msgCache.set(m.key.id, m);
+            if (msgCache.size > 2000) msgCache.delete(msgCache.keys().next().value);
+
         } catch (err) { console.error(err); }
     });
 
-    // ANTIDELETE LISTENER
+    // 6. ANTI-DELETE LISTENER
     conn.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
-            if (features.antidelete && update.update.protocolMessage?.type === 0) {
+            if (botSettings.antidelete.status && update.update.protocolMessage?.type === 0) {
                 const deletedId = update.update.protocolMessage.key.id;
                 const cachedMsg = msgCache.get(deletedId);
                 if (cachedMsg) {
-                    const ownerJid = jidNormalizedUser(conn.user.id);
+                    const ownerJid = OWNER_NUMBER + "@s.whatsapp.net";
                     const sender = jidNormalizedUser(cachedMsg.key.participant || cachedMsg.key.remoteJid);
-                    await conn.sendMessage(ownerJid, {
-                        text: `🛡️ *DELETED MESSAGE DETECTED*\n*From:* @${sender.split('@')[0]}`,
-                        mentions: [sender]
-                    });
+                    
+                    let report = `${botSettings.antidelete.notification}\n\n`;
+                    report += `👤 *Sender:* @${sender.split('@')[0]}\n`;
+                    if (cachedMsg.key.remoteJid.endsWith('@g.us')) {
+                        const meta = await conn.groupMetadata(cachedMsg.key.remoteJid);
+                        report += `📍 *Group:* ${meta.subject}\n`;
+                    }
+
+                    await conn.sendMessage(ownerJid, { text: report, mentions: [sender] });
                     await conn.sendMessage(ownerJid, { forward: cachedMsg }, { quoted: cachedMsg });
-                    logEvent("ANTIDELETE", `Recovered deleted message from ${sender} → sent to owner DM`);
                 }
             }
         }
     });
 
-    // CONNECTION DASHBOARD
-    conn.ev.on('connection.update', async (u) => {
+    conn.ev.on('connection.update', (u) => {
         const { connection, lastDisconnect } = u;
         if (connection === 'open') {
-            const ownerJid = jidNormalizedUser(conn.user.id);
-            const time = new Date().toLocaleTimeString();
-
-            const dashboard = "```" +
-                "  ⚔️ KNIGHT-LITE ULTRA ⚔️\n" +
-                "  ───────────────────────\n" +
-                "  [ SYSTEM STATUS: ONLINE ]\n\n" +
-                "  👤 USER: " + conn.user.name + "\n" +
-                "  ⏰ TIME: " + time + "\n" +
-                `  🛡️ ANTIDELETE: ${features.antidelete ? "ACTIVE" : "OFF"}\n` +
-                `  📸 VIEWONCE:   MANUAL (!vv)\n` +
-                `  🚫 ANTILINK:   ${features.antilink ? "SHIELD ON" : "OFF"}\n` +
-                `  👀 AUTO-VIEW:  ${features.autoview ? "ENABLED" : "OFF"}\n\n` +
-                "  ───────────────────────\n" +
-                "   K N I G H T - L I T E\n" +
-                "  ───────────────────────\n" +
-                "  TEST: Type !ping```";
-
-            await conn.sendMessage(ownerJid, { text: dashboard });
-            console.log('✅ KNIGHT-LITE ULTRA CONNECTED');
+            console.log('✅ ELIAKIM MD ☠️🇰🇪 CONNECTED');
+            console.log('👤 OWNER:', OWNER_NUMBER);
         }
         if (connection === 'close') {
             const shouldReconnect = (new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut);
