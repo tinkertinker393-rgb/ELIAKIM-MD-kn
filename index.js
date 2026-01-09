@@ -16,8 +16,9 @@ const os = require("os");
 // --- CONFIGURATION ---
 const SESSION_FOLDER = 'session';
 const SETTINGS_FILE = 'settings.json';
-const SESSION_ID = process.env.SESSION_ID; // Your Session ID
-const OWNER_NUMBER = "254746404008";     // Your specific number
+const SESSION_ID = process.env.SESSION_ID; 
+const OWNER_NUMBER = "254746404008"; 
+const OWNER_JID = OWNER_NUMBER + "@s.whatsapp.net";
 const PREFIX = "!";
 const logger = pino({ level: 'silent' });
 
@@ -26,32 +27,25 @@ const msgCache = new Map();
 const startTime = Date.now();
 
 let botSettings = {
-    antilink: { status: 'delete' }, // Always On by default
+    antilink: { status: 'delete' },
     antidelete: { status: true, notification: ' *Eliakim MD Anti-Delete* 🇰🇪' },
     autostatus: { autoview: true, autolike: true }
 };
 
-// Load saved settings if they exist
 if (fs.existsSync(SETTINGS_FILE)) {
-    botSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    try {
+        botSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    } catch (e) { console.error("Settings load error"); }
 }
 const saveSettings = () => fs.writeFileSync(SETTINGS_FILE, JSON.stringify(botSettings, null, 2));
 
-// --- CODING QUOTES ---
 const codingQuotes = [
     "“First, solve the problem. Then, write the code.” – John Johnson",
     "“Code is like humor. When you have to explain it, it’s bad.” – Cory House",
     "“Fix the cause, not the symptom.” – Steve Maguire",
-    "“Java is to JavaScript what car is to Carpet.” – Chris Heilmann",
-    "“Knowledge is power.” – Francis Bacon",
-    "“Sometimes it pays to stay in bed on Monday, rather than debugging Monday’s code.” – Dan Salomon",
-    "“Perfection is attained not when there is nothing more to add, but when there is nothing more to remove.”",
-    "“Before software can be reusable it first has to be usable.” – Ralph Johnson",
-    "“Computers are good at following instructions, but not at reading your mind.”",
     "“The best thing about a boolean is even if you are wrong, you are only off by a bit.”"
 ];
 
-// --- UTILS ---
 function runtime() {
     const seconds = Math.floor((Date.now() - startTime) / 1000);
     const h = Math.floor(seconds / 3600);
@@ -93,27 +87,30 @@ async function startBot() {
     // --- 3-HOUR QUOTE TIMER ---
     setInterval(async () => {
         try {
-            const ownerJid = OWNER_NUMBER + "@s.whatsapp.net";
-            const quote = codingQuotes[Math.floor(Math.random() * codingQuotes.length)];
-            await conn.sendMessage(ownerJid, { 
-                text: `💻 *ELIAKIM MD CODING QUOTE* 🇰🇪\n\n${quote}\n\n_Next quote in 3 hours..._` 
-            });
+            if (conn.user && OWNER_JID) {
+                const quote = codingQuotes[Math.floor(Math.random() * codingQuotes.length)];
+                await conn.sendMessage(OWNER_JID, { 
+                    text: `💻 *ELIAKIM MD CODING QUOTE* 🇰🇪\n\n${quote}\n\n_Next quote in 3 hours..._` 
+                });
+            }
         } catch (e) {}
     }, 3 * 60 * 60 * 1000);
 
     conn.ev.on('messages.upsert', async ({ messages }) => {
         try {
             const m = messages[0];
-            if (!m.message) return;
+            if (!m.message || !m.key.remoteJid) return;
 
             const from = m.key.remoteJid;
             const isGroup = from.endsWith('@g.us');
-            const sender = jidNormalizedUser(isGroup ? m.key.participant : from);
+            const participant = m.key.participant || from;
+            const sender = jidNormalizedUser(participant);
             const isOwner = sender.startsWith(OWNER_NUMBER) || m.key.fromMe;
-            const botNumber = jidNormalizedUser(conn.user.id);
+            const botNumber = conn.user ? jidNormalizedUser(conn.user.id) : null;
 
-            // 1. ALWAYS TYPING
-            if (!m.key.fromMe) await conn.sendPresenceUpdate('composing', from);
+            if (!m.key.fromMe && from !== 'status@broadcast') {
+                await conn.sendPresenceUpdate('composing', from);
+            }
 
             const type = getContentType(m.message);
             const content = type === 'ephemeralMessage' ? m.message.ephemeralMessage.message : m.message;
@@ -122,16 +119,18 @@ async function startBot() {
                          (msgType === 'extendedTextMessage') ? content.extendedTextMessage.text :
                          (content[msgType]?.caption) ? content[msgType].caption : '';
 
-            // 2. AUTO STATUS (VIEW & LIKE)
-            if (from === 'status@broadcast') {
+            // AUTO STATUS
+            if (from === 'status@broadcast' && botSettings.autostatus.autoview) {
                 await conn.readMessages([m.key]);
-                const statusEmojis = ['💛', '❤️', '💜', '🤍', '💙', '🇰🇪', '🔥'];
-                const emoji = statusEmojis[Math.floor(Math.random() * statusEmojis.length)];
-                await conn.sendMessage(from, { react: { key: m.key, text: emoji } }, { statusJidList: [m.key.participant, botNumber] });
+                if (botSettings.autostatus.autolike && m.key.participant) {
+                    const statusEmojis = ['💛', '❤️', '💜', '🤍', '💙', '🇰🇪', '🔥'];
+                    const emoji = statusEmojis[Math.floor(Math.random() * statusEmojis.length)];
+                    await conn.sendMessage(from, { react: { key: m.key, text: emoji } }, { statusJidList: [m.key.participant, botNumber].filter(Boolean) });
+                }
                 return;
             }
 
-            // 3. COMMANDS
+            // COMMANDS
             if (body.startsWith(PREFIX)) {
                 const args = body.slice(PREFIX.length).trim().split(/\s+/);
                 const command = args[0].toLowerCase();
@@ -169,53 +168,74 @@ async function startBot() {
                 }
             }
 
-            // 4. ANTI-LINK (Always On / Delete Only)
+            // ANTI-LINK
             const linkRegex = /(https?:\/\/[^\s]+)/g;
             if (botSettings.antilink.status === 'delete' && isGroup && linkRegex.test(body) && !m.key.fromMe) {
                 const groupMetadata = await conn.groupMetadata(from);
                 const admins = groupMetadata.participants.filter(p => p.admin !== null).map(p => jidNormalizedUser(p.id));
-                if (!admins.includes(sender) && admins.includes(botNumber)) {
+                if (!admins.includes(sender) && botNumber && admins.includes(botNumber)) {
                     await conn.sendMessage(from, { delete: m.key });
                 }
             }
 
-            // 5. CACHE FOR ANTI-DELETE
             msgCache.set(m.key.id, m);
             if (msgCache.size > 2000) msgCache.delete(msgCache.keys().next().value);
 
         } catch (err) { console.error(err); }
     });
 
-    // 6. ANTI-DELETE LISTENER
+    // ANTI-DELETE LISTENER
     conn.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             if (botSettings.antidelete.status && update.update.protocolMessage?.type === 0) {
                 const deletedId = update.update.protocolMessage.key.id;
                 const cachedMsg = msgCache.get(deletedId);
-                if (cachedMsg) {
-                    const ownerJid = OWNER_NUMBER + "@s.whatsapp.net";
+                if (cachedMsg && OWNER_JID) {
                     const sender = jidNormalizedUser(cachedMsg.key.participant || cachedMsg.key.remoteJid);
-                    
                     let report = `${botSettings.antidelete.notification}\n\n`;
                     report += `👤 *Sender:* @${sender.split('@')[0]}\n`;
                     if (cachedMsg.key.remoteJid.endsWith('@g.us')) {
-                        const meta = await conn.groupMetadata(cachedMsg.key.remoteJid);
-                        report += `📍 *Group:* ${meta.subject}\n`;
+                        try {
+                            const meta = await conn.groupMetadata(cachedMsg.key.remoteJid);
+                            report += `📍 *Group:* ${meta.subject}\n`;
+                        } catch (e) {}
                     }
-
-                    await conn.sendMessage(ownerJid, { text: report, mentions: [sender] });
-                    await conn.sendMessage(ownerJid, { forward: cachedMsg }, { quoted: cachedMsg });
+                    await conn.sendMessage(OWNER_JID, { text: report, mentions: [sender] });
+                    await conn.sendMessage(OWNER_JID, { forward: cachedMsg }, { quoted: cachedMsg });
                 }
             }
         }
     });
 
-    conn.ev.on('connection.update', (u) => {
+    conn.ev.on('connection.update', async (u) => {
         const { connection, lastDisconnect } = u;
         if (connection === 'open') {
             console.log('✅ ELIAKIM MD ☠️🇰🇪 CONNECTED');
-            console.log('👤 OWNER:', OWNER_NUMBER);
+
+            // --- MODERN CONNECTED MESSAGE ---
+            const connectedMsg = `
+╔══════════════════╗
+║   *ELIAKIM MD* ☠️🇰🇪   ║
+╚══════════════════╝
+
+*CONNECTED SUCCESSFULLY!* ✅
+
+👤 *Owner:* ${OWNER_NUMBER}
+⏱️ *Uptime:* ${runtime()}
+🛡️ *Anti-Link:* ${botSettings.antilink.status === 'delete' ? 'ON' : 'OFF'}
+🚫 *Anti-Delete:* ${botSettings.antidelete.status ? 'ON' : 'OFF'}
+📺 *Auto-Status:* ${botSettings.autostatus.autoview ? 'ON' : 'OFF'}
+
+💻 *System Info:*
+- *RAM:* ${(os.totalmem() / 1024 / 1024 / 1024).toFixed(1)}GB
+- *Platform:* ${os.platform()}
+
+_Eliakim MD is now monitoring your chats..._
+`.trim();
+
+            await conn.sendMessage(OWNER_JID, { text: connectedMsg });
         }
+        
         if (connection === 'close') {
             const shouldReconnect = (new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut);
             if (shouldReconnect) startBot();
