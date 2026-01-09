@@ -4,28 +4,33 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:
+    - cron: '0 */5 * * *' # Backup trigger every 5 hours
+  workflow_dispatch:      # Allows manual start
 
 concurrency:
   group: knight-lite-run
-  cancel-in-progress: true
+  cancel-in-progress: true # This kills the old run if a new one starts
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 310 # Total job limit (5 hours + 10 mins buffer)
     permissions:
-      contents: write # Allows GITHUB_TOKEN to save your session
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+
       - run: npm install
       
       - name: Run Bot
-        run: timeout 340m node index.js || echo "Restarting cycle..."
+        # Run for 300 minutes (5 hours)
+        run: timeout 300m node index.js || echo "Cycle ending..."
         env:
           SESSION_ID: ${{ secrets.SESSION_ID }}
 
@@ -37,3 +42,12 @@ jobs:
           file_pattern: 'session/*.json'
         env:
           GITHUB_TOKEN: ${{ secrets.WAZIMU }}
+
+      - name: Trigger Next Loop
+        if: always()
+        run: |
+          curl -X POST \
+          -H "Authorization: token ${{ secrets.WAZIMU }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/${{ github.repository }}/actions/workflows/kill.yml/dispatches \
+          -d '{"ref":"main"}'
