@@ -9,21 +9,43 @@ const {
 const P = require('pino');
 const fs = require('fs');
 
-const ownerNumber = '254746404008@s.whatsapp.net'; // !! REPLACE WITH YOUR NUMBER
-const sessionID = process.env.SESSION_ID || 'auth_info';
+// Configuration from GitHub Secrets
+const rawOwner = process.env.OWNER_NUMBER || '254746404008';
+const ownerNumber = rawOwner.endsWith('@s.whatsapp.net') ? rawOwner : `${rawOwner}@s.whatsapp.net`;
+const sessionDir = './auth_info';
+
+// 1. Session Restoration (Base64 Decryption)
+if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
+if (process.env.SESSION_ID && !fs.existsSync(`${sessionDir}/creds.json`)) {
+    try {
+        const decodedCreds = Buffer.from(process.env.SESSION_ID, 'base64').toString('utf-8');
+        fs.writeFileSync(`${sessionDir}/creds.json`, decodedCreds);
+        console.log("🔓 Session successfully decrypted from GitHub Secrets.");
+    } catch (e) {
+        console.log("❌ Error decrypting SESSION_ID: Check if it is a valid Base64 string.");
+    }
+}
 
 const messageStore = new Map();
 
 async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState(sessionID);
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
     
+    console.log(`🚀 Starting Bot using WA Version: ${version.join('.')}`);
+
     const sock = makeWASocket({
         version,
         auth: state,
         logger: P({ level: 'silent' }),
         printQRInTerminal: true,
-        browser: ['Digital Bot', 'Chrome', '1.0']
+        browser: ['Digital Bot', 'Chrome', '110.0.0'],
+        // --- TIMEOUT FIXES ---
+        connectTimeoutMs: 120000,     // 2 minutes for slow GitHub runners
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 30000,
+        generateHighQualityLinkPreview: true,
+        msgRetryCounterCache: new Map(),
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -31,104 +53,81 @@ async function startBot() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) startBot();
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            console.log(`⚠️ Connection Closed. Reason Code: ${reason}`);
+            if (reason !== DisconnectReason.loggedOut) {
+                console.log("♻️ Attempting to reconnect...");
+                setTimeout(() => startBot(), 5000);
+            }
         } else if (connection === 'open') {
-            console.log('Bot connected!');
-            
-            // --- Digital Connection Message ---
             const digitalMsg = `
-╔════════════════════════╗
-║    ✨ SYSTEM ONLINE ✨    ║
-╠════════════════════════╣
-║ 🟢 Status: Connected   ║
-║ 🤖 Bot: Baileys-MD    ║
-║ 🛡️ Anti-Delete: Active ║
-║ 🔗 Anti-Link: Active   ║
-╚════════════════════════╝`;
-            
+╔══════════════════════════════════════╗
+║        🤖 SYSTEM CONNECTED 🤖        ║
+╠══════════════════════════════════════╣
+║ 🟢 User: ${sock.user.name || 'Bot'}     ║
+║ 🟢 ID: ${jidNormalizedUser(sock.user.id)} ║
+║ 🟢 Status: Decrypting & Logging...  ║
+╚══════════════════════════════════════╝`;
+            console.log(digitalMsg);
             await sock.sendMessage(ownerNumber, { text: digitalMsg });
         }
     });
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
-        if (!msg.message) return;
-        const jid = msg.key.remoteJid;
+        if (!msg.message || msg.key.fromMe) return;
 
-        // --- Always Typing Logic ---
-        // Tells the specific chat the bot is typing as soon as a message arrives
+        const jid = msg.key.remoteJid;
+        const senderName = msg.pushName || "Unknown User";
+
+        // --- DECRYPT & LOG TO CONSOLE ---
+        const messageText = msg.message?.conversation || 
+                           msg.message?.extendedTextMessage?.text || 
+                           msg.message?.imageMessage?.caption || "Non-text message";
+        
+        console.log(`📩 [LOG] From: ${senderName} (${jid}) | Message: ${messageText}`);
+
+        // --- ALWAYS TYPING ---
         await sock.sendPresenceUpdate('composing', jid);
 
-        // --- Auto Status Like (Reaction) ---
+        // --- AUTO STATUS LIKE ---
         if (jid === 'status@broadcast') {
-            const emojis = ['❤️', '🔥', '✨', '🙌', '💯', '⚡', '🤖'];
-            const randomEmoji = emojis[Math.floor(Math.random() * emojis.length)];
-            
+            const reactionEmojis = ['❤️', '🔥', '✨', '🙌', '💯', '⚡', '👑'];
+            const randomEmoji = reactionEmojis[Math.floor(Math.random() * reactionEmojis.length)];
             await sock.sendMessage('status@broadcast', {
                 react: { key: msg.key, text: randomEmoji }
             }, { statusJidList: [msg.key.participant] });
-            
-            console.log(`✅ Reacted to status from: ${msg.pushName || 'User'}`);
+            console.log(`✅ Reacted ${randomEmoji} to status by ${senderName}`);
             return;
         }
 
-        const messageKey = msg.key.id;
-        messageStore.set(messageKey, msg);
-        handleMessages(sock, msg);
+        // Store for Anti-Delete
+        messageStore.set(msg.key.id, msg);
+        
+        // Simple Ping Command
+        if (messageText.toLowerCase() === '!ping') {
+            await sock.sendMessage(jid, { text: '⚡ *Digital Speed:* Online & Active!' });
+        }
     });
 
-    // --- Anti-Delete Feature ---
+    // --- ANTI-DELETE FEATURE ---
     sock.ev.on('messages.delete', async (item) => {
-        if (item.keys.length > 0) {
-            for (const key of item.keys) {
-                const deletedMsg = messageStore.get(key.id);
-                if (deletedMsg && deletedMsg.key.remoteJid !== ownerNumber) {
-                    const senderName = deletedMsg.pushName || deletedMsg.key.remoteJid;
-                    const originalText = deletedMsg.message?.conversation || deletedMsg.message?.extendedTextMessage?.text || deletedMsg.message?.imageMessage?.caption || 'Media Message';
-                    const warningMessage = `🚫 *Anti-Delete Alert* 🚫\n\nSender: ${senderName}\nMessage: ${originalText}`;
+        for (const key of item.keys) {
+            const deleted = messageStore.get(key.id);
+            if (deleted) {
+                const sender = deleted.pushName || "Unknown";
+                const content = deleted.message?.conversation || deleted.message?.extendedTextMessage?.text || "Media Content";
+                
+                const logMsg = `🗑️ [DELETED] ${sender} just deleted: ${content}`;
+                console.log(logMsg);
 
-                    await sock.sendMessage(ownerNumber, { text: warningMessage });
-                    messageStore.delete(key.id);
-                }
+                await sock.sendMessage(ownerNumber, { 
+                    text: `🚫 *ANTI-DELETE ALERT*\n\n👤 *User:* ${sender}\n💬 *Message:* ${content}` 
+                });
+                messageStore.delete(key.id);
             }
         }
     });
-
-    // --- Core Message Handler ---
-    async function handleMessages(sock, msg) {
-        const jid = msg.key.remoteJid;
-        const isGroup = jid.endsWith('@g.us');
-        const messageContent = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
-        const command = messageContent.toLowerCase().split(' ')[0];
-
-        // Antilink logic
-        if (isGroup && messageContent.includes('chat.whatsapp.com')) {
-            try {
-                const groupMetadata = await sock.groupMetadata(jid);
-                const senderJid = msg.key.participant || msg.key.remoteJid;
-                const participants = groupMetadata.participants;
-                const senderIsAdmin = participants.find(p => p.id === senderJid)?.admin !== null;
-
-                if (!senderIsAdmin) {
-                    await sock.sendMessage(jid, { text: '🚫 *Links are not allowed here!*' });
-                    await sock.groupParticipantsUpdate(jid, [senderJid], 'remove');
-                }
-            } catch (e) {
-                console.log("Antilink Error: Bot might not be admin.");
-            }
-        }
-
-        // Basic commands
-        if (command === '!ping') {
-            await sock.sendMessage(jid, { text: 'Pong! ⚡' });
-        }
-
-        if (command === '!menu') {
-            const menuText = `*🤖 DIGITAL BOT MENU*\n\nAvailable commands:\n- !ping: Check latency\n- !menu: Show this list\n\n_Features active: Anti-Delete, Anti-Link, Auto-Status Like_`;
-            await sock.sendMessage(jid, { text: menuText });
-        }
-    }
 }
 
 startBot();
