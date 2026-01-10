@@ -34,7 +34,8 @@ async function restoreSession() {
             let decoded;
             try { decoded = zlib.gunzipSync(buffer); } catch { decoded = buffer; }
             await fs.writeFile(credsPath, decoded);
-        } catch (e) { console.error("❌ Session Error"); }
+            console.log("✅ Credentials restored to ./session/creds.json");
+        } catch (e) { console.error("❌ Session Error:", e.message); }
     }
 }
 
@@ -48,9 +49,11 @@ async function startEliakim() {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
-        browser: [botName, "MacOS", "3.0.0"],
+        browser: [botName, "Chrome", "1.0.0"],
         markOnlineOnConnect: true,
-        syncFullHistory: false
+        syncFullHistory: false,
+        // Added to prevent some common cache errors
+        getMessage: async (key) => { return { conversation: 'Eliakim MD' } }
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -61,41 +64,30 @@ async function startEliakim() {
         if (connection === 'open') {
             console.log(`✅ ${botName} IS ONLINE`);
 
-            // --- COOL CONNECTED MESSAGE ---
-            const connectedMsg = `
+            // Small delay to ensure the socket internal cache is ready
+            setTimeout(async () => {
+                const connectedMsg = `
 ┏━━━━━━━━━━━━━━┓
 ┃  ⚡ *${botName} IS LIVE* ⚡
 ┗━━━━━━━━━━━━━━┛
-
 ✨ *System Status:* Online
 👤 *Owner:* ${OWNER_NUMBER}
 ⚙️ *Prefix:* [ ${PREFIX} ]
 🛡️ *Mode:* Public
 
 *🚀 ACTIVE MODULES:*
-   ├ 🛡️ Antidelete Active
-   ├ 👁️ ViewOnce Bypass
-   ├ ⌨️ Auto-Typing ON
-   ├ 📸 Auto-Status View
-   └ 🎭 Auto-Status React
+   ├ 🛡️ Antidelete: *Active*
+   ├ 👁️ ViewOnce: *Bypass*
+   ├ ⌨️ Auto-Typing: *ON*
+   ├ 📸 Status View: *ON*
+   └ 🎭 Status React: *ON*
 
-_“Privacy is not an option, it's a priority.”_
-__________________________
-*Powered by Eliakim MD*`.trim();
+_“Power and Privacy in one Bot.”_`.trim();
 
-            await sock.sendMessage(OWNER_JID, { 
-                text: connectedMsg,
-                contextInfo: {
-                    externalAdReply: {
-                        title: `${botName} CONNECTED`,
-                        body: "Multi-Device WhatsApp Bot",
-                        thumbnailUrl: "https://telegra.ph/file/dcce2ddee667597774274.jpg", // Optional thumbnail
-                        sourceUrl: "https://github.com/",
-                        mediaType: 1,
-                        renderLargerThumbnail: true
-                    }
-                }
-            });
+                try {
+                    await sock.sendMessage(OWNER_JID, { text: connectedMsg });
+                } catch (e) { console.log("Error sending welcome message:", e.message); }
+            }, 3000);
         }
 
         if (connection === 'close') {
@@ -112,32 +104,44 @@ __________________________
             const from = m.key.remoteJid;
             const botNumber = sock.user ? jidNormalizedUser(sock.user.id) : null;
 
-            // Always Typing
+            // 1. ALWAYS TYPING
             if (from !== 'status@broadcast') {
                 await sock.sendPresenceUpdate('composing', from);
             }
 
+            // 2. CACHE
             msgCache.set(m.key.id, m);
+            if (msgCache.size > 500) msgCache.delete(msgCache.keys().next().value);
 
-            // Auto Status View/React
+            // 3. AUTO STATUS (Fixed EKEYTYPE here)
             if (from === 'status@broadcast') {
                 await sock.readMessages([m.key]);
-                await sock.sendMessage(from, { react: { key: m.key, text: '🔥' } }, { statusJidList: [m.key.participant, botNumber] });
+                // SAFETY: Filter out undefined values from the JID list
+                const jidList = [m.key.participant, botNumber].filter(Boolean);
+                
+                if (jidList.length > 0) {
+                    await sock.sendMessage(from, 
+                        { react: { key: m.key, text: '❤️' } }, 
+                        { statusJidList: jidList }
+                    );
+                }
                 return;
             }
 
+            // 4. COMMANDS
             const type = getContentType(m.message);
             const body = (type === 'conversation') ? m.message.conversation : (type === 'extendedTextMessage') ? m.message.extendedTextMessage.text : '';
             
             if (body.startsWith(PREFIX)) {
                 const command = body.slice(PREFIX.length).trim().split(/\s+/)[0].toLowerCase();
                 if (command === "ping") {
-                    await sock.sendMessage(from, { text: `*Pong!* ⚡ ${Date.now() - m.messageTimestamp * 1000}ms` }, { quoted: m });
+                    await sock.sendMessage(from, { text: `🚀 *${botName} Speed:* ${Date.now() - m.messageTimestamp * 1000}ms` }, { quoted: m });
                 }
             }
-        } catch (e) { console.error(e); }
+        } catch (e) { console.error("Error in messages.upsert:", e.message); }
     });
 
+    // 5. ANTI-DELETE
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             if (update.update.protocolMessage?.type === 0) {
